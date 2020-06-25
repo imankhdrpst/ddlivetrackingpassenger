@@ -6,15 +6,18 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.text.TextUtils;
 import android.util.Log;
+import android.view.Menu;
+import android.view.MenuItem;
 import android.view.View;
 import android.widget.ArrayAdapter;
 import android.widget.ListView;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.widget.Toolbar;
 
 import androidx.annotation.NonNull;
+import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
-import androidx.fragment.app.FragmentActivity;
 
 import com.example.flatdialoglibrary.dialog.FlatDialog;
 import com.github.pwittchen.reactivebeacons.library.rx2.Beacon;
@@ -59,13 +62,13 @@ import static android.Manifest.permission.ACCESS_COARSE_LOCATION;
 import static android.Manifest.permission.ACCESS_FINE_LOCATION;
 import static android.content.pm.PackageManager.PERMISSION_GRANTED;
 
-public class MapsActivity extends FragmentActivity implements OnMapReadyCallback {
+public class MapsActivity extends AppCompatActivity implements OnMapReadyCallback {
 
     private static final String TAG = MapsActivity.class.getSimpleName();
     private static final boolean IS_AT_LEAST_ANDROID_M =
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.M;
     private static final int PERMISSIONS_REQUEST_CODE_ACCESS_COARSE_LOCATION = 1000;
-    private static final String ITEM_FORMAT = "MAC: %s\nUUID: %s\nRSSI: %d\nDistance: %.2fm\nProximity: %s\nName: %s";
+    private static final String ITEM_FORMAT = "MAC: %s\nUUID: %s\nRSSI: %d\nDistance(raw): %.2fm\nDistance(kalman): %.2f\nProximity: %s\nName: %s";
     private ReactiveBeacons reactiveBeacons;
     private Disposable subscription;
     private Map<String, Beacon> beacons;
@@ -83,12 +86,15 @@ public class MapsActivity extends FragmentActivity implements OnMapReadyCallback
     private TextView txtTimeStamp;
     private TextView txtBusy;
     private View layBusy;
+    private KalmanFilter kalmanFilter = new KalmanFilter();
+    private Toolbar mTopToolbar;
 
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_maps);
+
 
         txtToggle = findViewById(R.id.txt_toggle);
         expndLayout = findViewById(R.id.expandable_layout);
@@ -98,6 +104,7 @@ public class MapsActivity extends FragmentActivity implements OnMapReadyCallback
         txtBusy = findViewById(R.id.txt_busy);
         layBusy = findViewById(R.id.lay_busy);
         layBusy.setVisibility(View.GONE);
+
 
         txtToggle.setOnClickListener(new View.OnClickListener() {
             @Override
@@ -121,6 +128,13 @@ public class MapsActivity extends FragmentActivity implements OnMapReadyCallback
         email = getSharedPreferences("ddlivetrackingpassenger", MODE_PRIVATE).getString("email", "");
         password = getSharedPreferences("ddlivetrackingpassenger", MODE_PRIVATE).getString("password", "");
 
+        if (canObserveBeacons()) {
+            startSubscription();
+        }
+
+    }
+
+    private void login() {
         if (TextUtils.isEmpty(email)) {
             final FlatDialog flatDialog = new FlatDialog(MapsActivity.this);
             flatDialog.setCancelable(false);
@@ -154,7 +168,33 @@ public class MapsActivity extends FragmentActivity implements OnMapReadyCallback
         } else {
             loginToFirebase(email, password);
         }
+    }
 
+    @Override
+    public boolean onCreateOptionsMenu(Menu menu) {
+        // Inflate the menu; this adds items to the action bar if it is present.
+        getMenuInflater().inflate(R.menu.main_menu, menu);
+        return true;
+    }
+
+    @Override
+    public boolean onOptionsItemSelected(MenuItem item) {
+        // Handle action bar item clicks here. The action bar will
+        // automatically handle clicks on the Home/Up button, so long
+        // as you specify a parent activity in AndroidManifest.xml.
+        int id = item.getItemId();
+
+        //noinspection SimplifiableIfStatement
+        if (id == R.id.action_user) {
+            login();
+            return true;
+        }
+//        else if (id == R.id.action_ble)
+//        {
+//            return true;
+//        }
+
+        return super.onOptionsItemSelected(item);
     }
 
     /**
@@ -254,9 +294,7 @@ public class MapsActivity extends FragmentActivity implements OnMapReadyCallback
     }
 
     private void lookForDriver(String driver) {
-        if (canObserveBeacons()) {
-            startSubscription();
-        }
+
 
 
         DatabaseReference locationRef = FirebaseDatabase.getInstance().getReference("locs/" + driver + "/location");
@@ -347,6 +385,11 @@ public class MapsActivity extends FragmentActivity implements OnMapReadyCallback
                         beacons.put(beacon.device.getAddress(), beacon);
                         refreshBeaconList();
                     }
+                }, new Consumer<Throwable>() {
+                    @Override
+                    public void accept(Throwable throwable) throws Exception {
+                        int a = 0;
+                    }
                 });
     }
 
@@ -433,10 +476,11 @@ public class MapsActivity extends FragmentActivity implements OnMapReadyCallback
         String mac = beacon.device.getAddress();
         int rssi = beacon.rssi;
         double distance = beacon.getDistance();
+        double distanceKalman = kalmanFilter.applyFilter(beacon.rssi);
         Proximity proximity = beacon.getProximity();
         String name = beacon.device.getName();
         String uuid = getUUID(beacon.scanRecord);
-        return String.format(ITEM_FORMAT, mac, uuid == null ? "null" : uuid, rssi, distance, proximity, name);
+        return String.format(ITEM_FORMAT, mac, uuid == null ? "null" : uuid, rssi, distance, distanceKalman, proximity, name);
     }
 
     @Override
@@ -479,4 +523,43 @@ public class MapsActivity extends FragmentActivity implements OnMapReadyCallback
     private boolean isGranted(String permission) {
         return ActivityCompat.checkSelfPermission(this, permission) == PERMISSION_GRANTED;
     }
+
+    public class KalmanFilter {
+        private double processNoise;//Process noise
+        private double measurementNoise;//Measurement noise
+        private double estimatedRSSI;//calculated rssi
+        private double errorCovarianceRSSI;//calculated covariance
+        private boolean isInitialized = false;//initialization flag
+
+        public KalmanFilter() {
+            this.processNoise = 0.125;
+            this.measurementNoise = 0.8;
+        }
+
+        public KalmanFilter(double processNoise, double measurementNoise) {
+            this.processNoise = processNoise;
+            this.measurementNoise = measurementNoise;
+        }
+
+        public double applyFilter(double rssi) {
+            double priorRSSI;
+            double kalmanGain;
+            double priorErrorCovarianceRSSI;
+            if (!isInitialized) {
+                priorRSSI = rssi;
+                priorErrorCovarianceRSSI = 1;
+                isInitialized = true;
+            } else {
+                priorRSSI = estimatedRSSI;
+                priorErrorCovarianceRSSI = errorCovarianceRSSI + processNoise;
+            }
+
+            kalmanGain = priorErrorCovarianceRSSI / (priorErrorCovarianceRSSI + measurementNoise);
+            estimatedRSSI = priorRSSI + (kalmanGain * (rssi - priorRSSI));
+            errorCovarianceRSSI = (1 - kalmanGain) * priorErrorCovarianceRSSI;
+
+            return estimatedRSSI;
+        }
+    }
+
 }
